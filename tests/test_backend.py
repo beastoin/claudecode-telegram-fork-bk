@@ -51,22 +51,29 @@ def _bridge_env(monkeypatch, tmp_path):
 
 def test_backend_env_metadata():
     import bridge
-    import unittest.mock as mock
+    import claudecode
 
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
+    class FakeRunner:
+        def run(self, cmd, **kwargs):
+            calls.append(cmd)
 
-        class Result:
-            returncode = 0
-            stdout = ""
+            class Result:
+                returncode = 0
+                stdout = ""
 
-        return Result()
+            return Result()
 
-    with mock.patch.object(bridge, "subprocess") as mock_subprocess:
-        mock_subprocess.run.side_effect = fake_run
+        def popen(self, *a, **kw):
+            pass
+
+    saved = claudecode._subprocess_runner
+    try:
+        claudecode._subprocess_runner = FakeRunner()
         bridge.export_hook_env("claude-test-backend", "codex")
+    finally:
+        claudecode._subprocess_runner = saved
 
     found = any("WORKER_BACKEND" in cmd and "codex" in cmd for cmd in calls)
     assert found, f"WORKER_BACKEND=codex not set in tmux env: {calls}"

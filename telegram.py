@@ -2,34 +2,31 @@
 
 Handles all communication with the Telegram Bot API: sending and receiving
 messages, media handling, HTML sanitization, and message splitting.
+
+Independently importable — no bridge.py dependency at module level.
+Imports infrastructure from core.py (logging, DI seams, config).
+Owns all Telegram domain types (ChatId, TelegramMessageDict, etc.).
 """
 
 from __future__ import annotations
 
-import bridge as _bt
-from bridge import (
-    ChatId, MessageId, ParseMode, TelegramApiResponse, TelegramApiResponseDict,
+# ── Infrastructure from core (no circular dependency) ──────────────────
+from core import (
     _str_field, _int_field, _dict_field, _bool_field,
     _log, _LOG_ERROR, _LOG_WARN, _LOG_INFO, _LOG_DEBUG,
     _log_best_effort,
-    SubprocessRunner, Clock,
-    FileValidation,
+    SubprocessRunner, Clock, MarkdownToken,
+    _subprocess_runner, _urlopen,
+    AppContext, get_app_context,
     VERSION,
-    BOT_TOKEN, NODE_NAME,
-    NODE_DIR,
+    BOT_TOKEN, NODE_NAME, NODE_DIR,
     SESSIONS_DIR, TIMEOUT_HTTP_API, TIMEOUT_HTTP_DOWNLOAD, TIMEOUT_HTTP_UPLOAD,
     TIMEOUT_PROCESS_WAIT, TIMEOUT_FILE_TRANSFER, TIMEOUT_TMUX_CHECK,
     PENDING_TIMEOUT,
     STT_ENDPOINT, STT_TIMEOUT,
     TEAM_DIR,
-    MediaGroupEntry, ReminderState,
-    MarkdownToken,
-    AppContext, get_app_context,
-    _subprocess_runner, _urlopen,
     ADMIN_CHAT_ID_ENV, admin_chat_id,
     DEFAULT_BACKEND,
-    WorkerStateEntry,
-    TmuxSessionDict,
 )
 
 import collections
@@ -54,7 +51,165 @@ import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 from collections.abc import Iterable, Mapping
-from typing import IO, Any, Callable, Iterator, Literal, NamedTuple, Protocol, TypedDict, cast, runtime_checkable
+from typing import IO, Any, Callable, Iterator, Literal, NamedTuple, Protocol, TypedDict, TYPE_CHECKING, cast, runtime_checkable
+
+
+# ── Telegram domain types (owned by this module) ─────────────────────
+
+ChatId = int | str
+
+MessageId = int
+
+ParseMode = Literal["HTML", "MarkdownV2"] | None
+
+
+class TelegramApiResponseDict(TypedDict, total=False):
+    """Shape of a Telegram Bot API JSON response."""
+    ok: bool
+    result: object  # varies by method — Message, User, bool, etc.
+    description: str
+    error_code: int
+
+
+TelegramApiResponse = TelegramApiResponseDict | None
+
+
+class TelegramUser(TypedDict, total=False):
+    """Telegram User object fields."""
+    id: int
+    is_bot: bool
+    first_name: str
+    last_name: str
+    username: str
+
+
+class TelegramChat(TypedDict, total=False):
+    """Telegram Chat object fields."""
+    id: int
+    type: str
+    title: str
+    username: str
+
+
+class TelegramPhotoSize(TypedDict, total=False):
+    """Telegram PhotoSize object fields."""
+    file_id: str
+    file_unique_id: str
+    width: int
+    height: int
+    file_size: int
+
+
+class TelegramDocument(TypedDict, total=False):
+    """Telegram Document object fields."""
+    file_id: str
+    file_unique_id: str
+    file_name: str
+    mime_type: str
+    file_size: int
+
+
+class TelegramVoice(TypedDict, total=False):
+    """Telegram Voice object fields."""
+    file_id: str
+    file_unique_id: str
+    duration: int
+    mime_type: str
+    file_size: int
+
+
+class TelegramVideo(TypedDict, total=False):
+    """Telegram Video object fields."""
+    file_id: str
+    file_unique_id: str
+    width: int
+    height: int
+    duration: int
+    file_name: str
+    mime_type: str
+    file_size: int
+
+
+class TelegramAudio(TypedDict, total=False):
+    """Telegram Audio object fields."""
+    file_id: str
+    file_unique_id: str
+    duration: int
+    performer: str
+    title: str
+    file_name: str
+    mime_type: str
+    file_size: int
+
+
+class TelegramSticker(TypedDict, total=False):
+    """Telegram Sticker object fields."""
+    file_id: str
+    file_unique_id: str
+    width: int
+    height: int
+    emoji: str
+    type: str
+    is_animated: bool
+    is_video: bool
+
+
+class TelegramMessageDict(TypedDict, total=False):
+    """Telegram Message object fields (raw JSON from API)."""
+    message_id: int
+    chat: TelegramChat
+    date: int
+    text: str
+    photo: list[TelegramPhotoSize]
+    document: TelegramDocument
+    voice: TelegramVoice
+    video: TelegramVideo
+    video_note: TelegramVideo
+    animation: TelegramDocument
+    audio: TelegramAudio
+    sticker: TelegramSticker
+    reply_to_message: "TelegramMessageDict"
+    caption: str
+    media_group_id: str
+    rich_message: dict[str, str]  # {"markdown": str} — Telegram rich message block
+
+
+# Note: Telegram API uses "from" (a Python keyword), so we use functional TypedDict form.
+TelegramCallbackQuery = TypedDict("TelegramCallbackQuery", {
+    "id": str,
+    "from": TelegramUser,
+    "message": TelegramMessageDict,
+    "data": str,
+}, total=False)
+
+
+class TelegramUpdate(TypedDict, total=False):
+    """Telegram Update object fields (raw webhook payload)."""
+    update_id: int
+    message: TelegramMessageDict
+    edited_message: TelegramMessageDict
+    callback_query: TelegramCallbackQuery
+
+
+class FileValidation(NamedTuple):
+    """Result of validating a file path (photo or document)."""
+    ok: bool
+    detail: Path | str  # Path on success, error message on failure
+
+
+class MediaGroupEntry(TypedDict):
+    """Buffered media group state during collection."""
+    items: list[TelegramMessageDict]
+    caption: str
+    timer: threading.Timer | None
+
+
+# ── Cross-module type annotations (TYPE_CHECKING only) ───────────────
+# WorkerStateEntry and TmuxSessionDict are claudecode-owned types used
+# in function signatures here. With `from __future__ import annotations`,
+# all annotations are strings at runtime — no circular import.
+if TYPE_CHECKING:
+    from claudecode import WorkerStateEntry, TmuxSessionDict
 
 
 

@@ -3,8 +3,8 @@
 Behavior tests: each test verifies something the bridge or manager
 actually depends on, not that code structure exists.
 """
-import bridge  # must load first (provides shared types to claudecode)
 import claudecode
+import bridge
 
 import json
 import os

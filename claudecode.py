@@ -2,14 +2,16 @@
 
 Manages Claude Code worker lifecycle: tmux sessions, backends (Claude CLI,
 Codex), session state, machine registry, and worker health monitoring.
+
+Independently importable — no bridge.py dependency at module level.
+Imports infrastructure from core.py (logging, DI seams, config).
+Owns all worker domain types (WorkerStateEntry, TmuxSessionDict, etc.).
 """
 
 from __future__ import annotations
 
-import bridge as _bt
-from bridge import *  # noqa: F401,F403
-# Underscore names excluded from * import — import explicitly
-from bridge import (
+# ── Infrastructure from core (no circular dependency) ──────────────────
+from core import (
     _subprocess_runner, _clock,
     _log, _log_best_effort,
     _str_field, _int_field, _dict_field, _bool_field,
@@ -19,6 +21,40 @@ from bridge import (
     _wd_cfg, _res_cfg, _urlopen,
     _DEFAULT_PORTS, _bridge_url_env, _mounts_env, _node_name,
     _CHECKIN_NOTE_PATH, _LEARNING_REMINDER_PATH,
+    SubprocessRunner, Clock, MarkdownToken,
+    AppContext, get_app_context,
+    VERSION,
+    BOT_TOKEN, NODE_NAME, NODE_DIR,
+    PORT, BRIDGE_BIND, BRIDGE_URL, BRIDGE_PUBLIC_URL, BRIDGE_SSH_TARGET,
+    SESSIONS_DIR, TMUX_PREFIX,
+    CLAUDE_DIR, CLAUDE_SETTINGS_FILE,
+    TIMEOUT_TMUX_CHECK, TIMEOUT_TMUX_SEND, TIMEOUT_REMOTE_CMD,
+    TIMEOUT_FILE_TRANSFER, TIMEOUT_GIT_OP, TIMEOUT_LARGE_TRANSFER,
+    TIMEOUT_RSYNC, TIMEOUT_FULL_SYNC,
+    TIMEOUT_HTTP_API, TIMEOUT_HTTP_DOWNLOAD, TIMEOUT_HTTP_UPLOAD,
+    TIMEOUT_PROCESS_WAIT, TIMEOUT_THREAD_JOIN,
+    DELAY_TMUX_SEND, DELAY_PIPE_POLL, DELAY_STARTUP, DELAY_STARTUP_LONG,
+    DELAY_RETRY, DELAY_BRIEF, DELAY_SHORT, DELAY_RESPONSE_GAP,
+    DELAY_PROCESS_SETTLE, DELAY_CLAUDE_LOAD,
+    DEFAULT_BACKEND, DEFAULT_WORKER_BACKEND, PENDING_TIMEOUT,
+    FILE_INBOX_ROOT, WORKER_PIPE_ROOT,
+    SANDBOX_ENABLED, SANDBOX_IMAGE, SANDBOX_EXTRA_MOUNTS,
+    TEAM_DIR,
+    MACHINES_CONFIG_FILE,
+    WEBHOOK_SECRET,
+    WatchdogConfig, ResourceAlertConfig, MediaConfig,
+    WATCHDOG_INTERVAL, START_GRACE, THINK_GRACE, TOOL_GAP_GRACE,
+    STALE_PENDING, CPU_ACTIVE, CPU_IDLE, IDLE_STREAK_STUCK, ALERT_COOLDOWN,
+    RESTART_COOLDOWN,
+    DISK_WARN_PCT, DISK_ALERT_PCT, DISK_ALERT_GB, DISK_COOLDOWN,
+    CPU_HOG_PCT, CPU_HOG_DURATION_MIN, CPU_HOG_COOLDOWN,
+    WORKTREE_THRESHOLD_GB, WORKTREE_COOLDOWN,
+    MEM_THRESHOLD_PCT, MEM_THRESHOLD_GB, MEM_COOLDOWN,
+    IO_IOWAIT_PCT, IO_COOLDOWN, INFRA_COOLDOWN,
+    HOST_DOWN_THRESHOLD,
+    PERSISTENCE_NOTE,
+    STT_ENDPOINT, STT_TIMEOUT,
+    ADMIN_CHAT_ID_ENV, admin_chat_id,
 )
 
 import collections
@@ -45,8 +81,337 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from collections.abc import Iterable, Mapping
-from typing import IO, Any, Callable, Iterator, Literal, NamedTuple, Protocol, TypedDict, cast, runtime_checkable
+from typing import IO, Any, Callable, Iterator, Literal, NamedTuple, Protocol, TypedDict, TYPE_CHECKING, cast, runtime_checkable
 from urllib.parse import urlparse
+
+
+# ── Claudecode domain types (owned by this module) ───────────────────
+
+
+class ReminderState(TypedDict):
+    """Per-worker learning-reminder state."""
+    response_count: int
+    last_reminder_ts: float
+    last_response_ts: float
+    reminder_pending: bool
+
+
+class WorkerStateEntry(NamedTuple):
+    """Worker state as tracked by watchdog: (status, reason, since_timestamp)."""
+    status: str
+    reason: str
+    since: float
+
+
+class ParsedWorkerTarget(NamedTuple):
+    """Result of parsing 'name@host' or 'name' worker target."""
+    name: str
+    host: str | None
+
+
+class TmuxActivityResult(NamedTuple):
+    """Result of reading tmux pane activity."""
+    activity: str
+    context_pct: str | None
+    raw_lines: list[str] | None
+
+
+class AuthorDetection(NamedTuple):
+    """Result of detecting message author from text prefix."""
+    author: str
+    avatar_html: str
+    display_text: str
+
+
+class TmuxSessionDict(TypedDict, total=False):
+    """Shape of a scanned tmux session entry."""
+    tmux: str
+    backend: str
+    host: str           # optional — present only for remote sessions
+    protocol: str       # optional — relay protocol version
+    callback_url: str   # optional — callback URL for relay workers
+    version: str        # optional — bridge version
+    activity: str       # optional — current activity
+    context_pct: str    # optional — context usage percentage
+
+
+class WorkerSessionDict(TypedDict, total=False):
+    """Shape of a legacy session dict for backward compatibility."""
+    backend: str
+    tmux: str
+    host: str
+    callback_url: str
+    protocol: str
+    version: str
+
+
+class RegistryWorkerDict(TypedDict, total=False):
+    """Raw dict shape of a single worker entry in workers.json."""
+    backend: str
+    chat_id: int | None
+    hire_time: int
+    host: str           # optional
+    home_host: str | None  # optional — preserved across re-registrations
+    home_cwd: str | None   # optional — preserved across re-registrations
+    protocol: str       # optional — "http" for callback workers
+    callback_url: str   # optional — for callback workers
+    version: str        # optional — for callback workers
+    tools: dict[str, object]  # optional — for callback workers; shape varies
+
+
+class RegistryFileDict(TypedDict, total=False):
+    """Raw dict shape of the top-level workers.json file."""
+    version: int
+    workers: dict[str, RegistryWorkerDict]
+
+
+class RewindTokenEntry(TypedDict):
+    """Shape of entries in REWIND_TOKENS."""
+    name: str
+    expires_at: float
+
+
+class PrReviewTokenEntry(TypedDict):
+    """Shape of entries in PR_REVIEW_TOKENS."""
+    pr_num: int
+    owner: str
+    repo: str
+    expires_at: float
+
+
+class ProcStatsEntry(TypedDict):
+    """Per-process stats from ps (used by _ps_stats)."""
+    cpu: float
+    state: str
+
+
+class QuestionOption(TypedDict):
+    """A single option in an interactive prompt."""
+    num: int
+    label: str
+    selected: bool
+
+
+class QuestionDetails(TypedDict):
+    """Interactive question details extracted from tmux pane output."""
+    header: str
+    options: list[QuestionOption]
+    selected_num: int
+
+
+class DiskUsageDict(TypedDict, total=False):
+    """Disk usage probe result from _check_disk_usage."""
+    pct: float
+    free_gb: float
+    total_gb: float
+    ts: float  # added when stored in HostHealthState
+
+
+class MemUsageDict(TypedDict, total=False):
+    """Memory usage probe result from _check_mem_usage."""
+    pct: int | float
+    used_gb: float
+    total_gb: float
+    avail_gb: float
+    top_procs: list[dict[str, object]]
+    ts: float
+
+
+class IoUsageDict(TypedDict, total=False):
+    """IO probe result from _check_io_usage."""
+    iowait_pct: float
+    read_iops: int
+    write_iops: int
+    util_pct: float
+    ts: float
+
+
+class WorktreeItemDict(TypedDict):
+    """Single worktree entry in worktree usage probe."""
+    path: str
+    size_gb: float
+
+
+class WorktreeUsageDict(TypedDict):
+    """Worktree usage probe result for a host."""
+    total_gb: float
+    items: list[WorktreeItemDict]
+    ts: float
+
+
+class CpuHogEntry(TypedDict, total=False):
+    """Process entry from _get_cpu_hogs."""
+    pid: int
+    cpu: float
+    etime_min: int
+    cmd: str
+
+
+class HealthSummaryDict(TypedDict, total=False):
+    """Per-host health summary returned by HostHealthState.to_health_summary."""
+    ssh_down: bool
+    ssh_down_since: float | None
+    disk: DiskUsageDict | None
+    mem: MemUsageDict | None
+    io: IoUsageDict | None
+    cpu_hogs: list[CpuHogEntry]
+    worktrees: WorktreeUsageDict | None
+
+
+class MachineHealthDict(TypedDict, total=False):
+    """Health status for a single machine."""
+    status: str
+    down_since: float | None
+    last_error: str | None
+    disk: DiskUsageDict | None
+    memory: MemUsageDict | None
+    io: IoUsageDict | None
+
+
+class CodexTranscriptEntry(TypedDict, total=False):
+    """A parsed entry from a codex transcript."""
+    role: str
+    text: str
+    timestamp: str
+
+
+class GitPushStateResult(TypedDict, total=False):
+    """Result metadata from _git_push_state."""
+    orig_sha: str
+    orig_branch: str
+    staged_files: list[str]
+    stash_sha: str | None
+
+
+class ProcessRegistry:
+    """Tracks background process PIDs, pipe reader threads, and pending locks."""
+
+    def __init__(self) -> None:
+        """Initialize adapter process tracking and bridge PID references."""
+        self.adapter_pids: dict[str, tuple[subprocess.Popen[str], IO[str] | None]] = {}
+        self.adapter_pids_lock: threading.Lock = threading.Lock()
+        self.pipe_readers: dict[str, tuple[threading.Thread, threading.Event]] = {}
+        self.pipe_readers_lock: threading.Lock = threading.Lock()
+        self.pending_locks: dict[str, threading.Lock] = {}
+        self.pending_locks_guard: threading.Lock = threading.Lock()
+
+
+class WorkerWatchdogState:
+    """Tracks per-worker health, probe results, restart coordination, and watchdog locks."""
+
+    def __init__(self) -> None:
+        # Worker probe state
+        """Initialize worker watchdog counters, locks, and health maps."""
+        self.worker_states: dict[str, WorkerStateEntry] = {}
+        self.last_child_ts: dict[str, float] = {}
+        self.last_seen_claude: dict[str, float] = {}
+        self.last_hook_ts: dict[str, float] = {}
+        self.last_alert_ts: dict[str, float] = {}
+        self.alert_msg_ids: dict[str, tuple[int, str]] = {}
+        self.idle_streak: dict[str, int] = {}
+        self.prev_worker_states: dict[str, str] = {}
+        self.consecutive_probe_failures: dict[str, int] = {}
+        self.consecutive_good_probes: dict[str, int] = {}
+        self.consecutive_bad_probes: dict[str, int] = {}
+        self.idle_child_baseline: dict[str, int] = {}
+        self.prev_children: dict[str, int] = {}
+        self.last_activity_ts: dict[str, float] = {}
+        self.worker_cwds: dict[str, str] = {}
+        # Restart coordination
+        self.recent_restarts: dict[str, float] = {}
+        self.restart_in_progress: dict[str, float] = {}
+        self.restart_lock: threading.Lock = threading.Lock()
+        self.force_restart_pending_cwd: dict[str, bool] = {}
+        self.waiting_input_details: dict[str, QuestionDetails] = {}
+        # Alert cooldowns
+        self.last_resolved_ts: dict[str, float] = {}
+        # Global watchdog lock
+        self.lock: threading.Lock = threading.Lock()
+        # Stop event for clean shutdown
+        self.stop_event: threading.Event = threading.Event()
+
+    def reset(self) -> None:
+        """Reset all state (useful for testing)."""
+        self.__init__()  # type: ignore[misc]
+
+    def clear_worker(self, name: str) -> None:
+        """Remove all tracking state for a worker."""
+        for store in (
+            self.worker_states, self.last_child_ts, self.last_seen_claude,
+            self.last_hook_ts, self.last_alert_ts, self.alert_msg_ids,
+            self.idle_streak, self.prev_worker_states,
+            self.consecutive_probe_failures, self.consecutive_good_probes,
+            self.consecutive_bad_probes, self.idle_child_baseline,
+            self.prev_children, self.last_activity_ts, self.worker_cwds,
+            self.recent_restarts, self.restart_in_progress,
+            self.force_restart_pending_cwd, self.waiting_input_details,
+            self.last_resolved_ts,
+        ):
+            store.pop(name, None)
+
+
+class LearningReminderState:
+    """Tracks per-worker learning reminder counters, timers, and persistence."""
+
+    def __init__(self) -> None:
+        """Initialize per-worker reminder counters, lock, and idle timer."""
+        self.state: dict[str, ReminderState] = {}
+        self.lock: threading.Lock = threading.Lock()
+        self.idle_scan_timer: threading.Timer | None = None
+
+
+class HostHealthState:
+    """Tracks health metrics for all remote hosts (SSH, disk, CPU, memory, IO, worktrees, Tailscale).
+
+    Thread safety: all reads/writes to mutable dicts must be under watchdog.lock
+    (the canonical lock for all watchdog + host_health state).
+    """
+
+    def __init__(self) -> None:
+        """Initialize per-host health metrics (SSH, disk, memory, IO, CPU, Tailscale)."""
+        # SSH connectivity
+        self.ssh_failures: dict[str, int] = {}
+        self.down: dict[str, bool] = {}
+        self.down_since: dict[str, float] = {}
+        self.last_error: dict[str, str] = {}
+        # Disk
+        self.disk_usage: dict[str, DiskUsageDict] = {}
+        self.disk_alert_ts: dict[str, float] = {}
+        self.disk_alerted: dict[str, str | bool] = {}
+        # CPU hogs
+        self.cpu_hogs: dict[str, list[CpuHogEntry]] = {}
+        self.cpu_hog_alert_ts: dict[str, float] = {}
+        # Worktrees
+        self.worktree_usage: dict[str, WorktreeUsageDict] = {}
+        self.worktree_alert_ts: dict[str, float] = {}
+        self.worktree_alerted: dict[str, bool] = {}
+        # Memory
+        self.mem_usage: dict[str, MemUsageDict] = {}
+        self.mem_alert_ts: dict[str, float] = {}
+        self.mem_alerted: dict[str, bool] = {}
+        # IO
+        self.io_usage: dict[str, IoUsageDict] = {}
+        self.io_alert_ts: dict[str, float] = {}
+        self.io_alerted: dict[str, bool] = {}
+        # Infra / Tailscale
+        self.tailscale_down: bool = False
+        self.tailscale_alert_ts: float = 0.0
+
+    def reset(self) -> None:
+        """Reset all state (useful for testing)."""
+        self.__init__()  # type: ignore[misc]
+
+    def to_health_summary(self, host: str) -> HealthSummaryDict:
+        """Return a typed summary dict for a single host."""
+        return HealthSummaryDict(
+            ssh_down=self.down.get(host, False),
+            ssh_down_since=self.down_since.get(host),
+            disk=self.disk_usage.get(host),
+            mem=self.mem_usage.get(host),
+            io=self.io_usage.get(host),
+            cpu_hogs=self.cpu_hogs.get(host, []),
+            worktrees=self.worktree_usage.get(host),
+        )
 
 
 
@@ -792,26 +1157,14 @@ def is_claude_running(tmux_name: str, host: str | None = None) -> bool:
 
 
 
-# ── Classes from bridge.py needed for singleton instantiation ──
-
-from bridge import (  # noqa: E402
-    ProcessRegistry,
-    WorkerWatchdogState,
-    LearningReminderState,
-)
-
 # Singletons: instantiated here, shared with bridge.py via _BridgeModule propagation.
 processes = ProcessRegistry()
 watchdog = WorkerWatchdogState()
 learning_reminders = LearningReminderState()
+host_health = HostHealthState()
 # worker_manager is set by bridge.py after WorkerManager class loads (defined after import).
 # Stub None so _BridgeModule.__setattr__ propagation can fill it.
 worker_manager = None
-
-
-
-import bridge as _bh  # noqa: E402
-host_health = _bh.HostHealthState()
 
 
 # Learning reminders: periodic self-learning nudges per worker

@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel
 
-This is the HTTP server and command routing layer. Business logic lives in:
-  - telegram.py: Telegram Bot API, transport, and message formatting
-  - claudecode.py: Worker management, backends, tmux, and sessions
+Composition root: HTTP server, command routing, wires telegram.py and
+claudecode.py together. Shared infrastructure lives in core.py.
 
-Types, constants, and DI seams are defined at the top of this file (were
-formerly in bridge_types.py) so they are available before telegram.py and
-claudecode.py are imported (both do ``from bridge import ...`` at load time).
+Module dependency graph (no circular imports):
+    core.py          ← types, constants, logging, DI seams
+      ↓
+    telegram.py      ← Telegram API, imports core
+    claudecode.py    ← worker management, imports core
+      ↓
+    bridge.py        ← this file, imports all three
 """
-
-# ── Shared types, constants, and DI seams ─────────────────────────────
-# These MUST be defined before ``from telegram import *`` below because
-# telegram.py and claudecode.py import from bridge at their own load time.
 
 import collections
 from dataclasses import dataclass, field
@@ -41,197 +40,66 @@ from pathlib import Path
 from collections.abc import Iterable, Mapping
 from typing import IO, Any, Callable, Iterator, Literal, NamedTuple, Protocol, TypedDict, cast, runtime_checkable
 
-
-VERSION = "0.44.0"
-
-
-# ── Type aliases for clarity ────────────────────────────────────────────
-ChatId = int | str
-
-MessageId = int
-
-ParseMode = Literal["HTML", "MarkdownV2"] | None
-
-class TelegramApiResponseDict(TypedDict, total=False):
-    """Shape of a Telegram Bot API JSON response."""
-    ok: bool
-    result: object  # varies by method — Message, User, bool, etc.
-    description: str
-    error_code: int
+# ── Re-export everything from core so existing `from bridge import X` works ──
+from core import *  # noqa: F401,F403
+from core import (  # underscore names not in *
+    _str_field, _int_field, _dict_field, _bool_field,
+    _log, _log_best_effort,
+    _LOG_ERROR, _LOG_WARN, _LOG_INFO, _LOG_DEBUG,
+    _subprocess_runner, _clock, _urlopen,
+    _RealSubprocessRunner, _RealClock,
+    _build_app_context,
+    _wd_cfg, _res_cfg,
+    _DEFAULT_PORTS, _bridge_url_env, _mounts_env, _node_name,
+    _CHECKIN_NOTE_PATH, _LEARNING_REMINDER_PATH,
+    _app_context,
+)
 
 
-TelegramApiResponse = TelegramApiResponseDict | None
+# ── Import domain types from owning modules ──────────────────────────
+# telegram.py and claudecode.py each define their own types and can be
+# imported independently (no circular dependency).  bridge.py imports
+# everything here so `from bridge import ChatId` still works.
+
+from telegram import *  # noqa: F401,F403
+from telegram import (
+    _TelegramHTMLSanitizer,
+    _init_transport,
+    _prepare_photo_for_telegram,
+    _split_protected_segments, _collapse_excess_newlines,
+    _parse_media_tags,
+    _sanitize_telegram_html,
+    _render_md_inline_plain, _render_md_inline_html,
+    _render_table_as_pre, _wrap_plain_tables,
+    _pipe_tables_to_html,
+    _MEDIA_GROUP_WAIT,
+    _extract_msg_text,
+    _build_cwd_change_notice,
+    _normalize_activity,
+    _team_attention_summary,
+    _format_watchdog_status as _format_watchdog_status_pure,
+    format_team_lines as _format_team_lines_pure,
+)
+
+from claudecode import *  # noqa: F401,F403
+from claudecode import (  # underscore names excluded from * import
+    _acquire_flock, _cache_session_id, _capture_pane_text,
+    _codex_load_session_id, _codex_save_session_id,
+    _codex_session_id_path, _detect_os_family,
+    _ensure_workspace_trusted, _find_codex_transcript, _forward_pipe_message,
+    _get_remote_home, _get_tmux_send_lock,
+    _INTERACTIVE_CONTENT, _INTERACTIVE_FOOTERS,
+    _is_git_repo, _LEARNING_REMINDER_TEXT, _log_session_event, _project_slug,
+    _release_flock, _remote_run, _resolve_remote_tool,
+    _scan_latest_session_id, _tmux_pane_pids,
+    _which_binary,
+)
 
 
-# ── Safe JSON field accessors ────────────────────────────────────────────
-# After cast(<TypedDict>, json.loads(...)), .get() returns the declared type.
-# For TypedDicts with total=False, .get() returns the field type | None.
-# These helpers narrow to concrete types so callers can .strip(), compare, etc.
-
-
-def _str_field(d: Mapping[str, object], key: str, default: str = "") -> str:
-    """Extract a string field from a parsed JSON dict, with type narrowing."""
-    val = d.get(key, default)
-    return str(val) if val is not None else default
-
-
-
-def _int_field(d: Mapping[str, object], key: str, default: int = 0) -> int:
-    """Extract an int field from a parsed JSON dict, with type narrowing."""
-    val = d.get(key, default)
-    if isinstance(val, int):
-        return val
-    if isinstance(val, str):
-        try:
-            return int(val)
-        except ValueError:
-            return default
-    return default
-
-
-
-def _dict_field(d: Mapping[str, object], key: str) -> Mapping[str, object]:
-    """Extract a dict field, returning empty dict if missing or wrong type."""
-    val = d.get(key)
-    return val if isinstance(val, dict) else {}
-
-
-
-def _bool_field(d: Mapping[str, object], key: str, default: bool = False) -> bool:
-    """Extract a bool field from a parsed JSON dict, with type narrowing."""
-    val = d.get(key, default)
-    return bool(val)
-
-
-
-# ── TypedDict models for raw JSON shapes ────────────────────────────────
-
-
-class TelegramUser(TypedDict, total=False):
-    """Telegram User object fields."""
-    id: int
-    is_bot: bool
-    first_name: str
-    last_name: str
-    username: str
-
-
-
-class TelegramChat(TypedDict, total=False):
-    """Telegram Chat object fields."""
-    id: int
-    type: str
-    title: str
-    username: str
-
-
-
-class TelegramPhotoSize(TypedDict, total=False):
-    """Telegram PhotoSize object fields."""
-    file_id: str
-    file_unique_id: str
-    width: int
-    height: int
-    file_size: int
-
-
-
-class TelegramDocument(TypedDict, total=False):
-    """Telegram Document object fields."""
-    file_id: str
-    file_unique_id: str
-    file_name: str
-    mime_type: str
-    file_size: int
-
-
-
-class TelegramVoice(TypedDict, total=False):
-    """Telegram Voice object fields."""
-    file_id: str
-    file_unique_id: str
-    duration: int
-    mime_type: str
-    file_size: int
-
-
-
-class TelegramVideo(TypedDict, total=False):
-    """Telegram Video object fields."""
-    file_id: str
-    file_unique_id: str
-    width: int
-    height: int
-    duration: int
-    file_name: str
-    mime_type: str
-    file_size: int
-
-
-
-class TelegramAudio(TypedDict, total=False):
-    """Telegram Audio object fields."""
-    file_id: str
-    file_unique_id: str
-    duration: int
-    performer: str
-    title: str
-    file_name: str
-    mime_type: str
-    file_size: int
-
-
-
-class TelegramSticker(TypedDict, total=False):
-    """Telegram Sticker object fields."""
-    file_id: str
-    file_unique_id: str
-    width: int
-    height: int
-    emoji: str
-    type: str
-    is_animated: bool
-    is_video: bool
-
-
-
-class TelegramMessageDict(TypedDict, total=False):
-    """Telegram Message object fields (raw JSON from API)."""
-    message_id: int
-    chat: TelegramChat
-    date: int
-    text: str
-    photo: list[TelegramPhotoSize]
-    document: TelegramDocument
-    voice: TelegramVoice
-    video: TelegramVideo
-    video_note: TelegramVideo
-    animation: TelegramDocument
-    audio: TelegramAudio
-    sticker: TelegramSticker
-    reply_to_message: "TelegramMessageDict"
-    caption: str
-    media_group_id: str
-    rich_message: dict[str, str]  # {"markdown": str} — Telegram rich message block
-
-
-
-# Note: Telegram API uses "from" (a Python keyword), so we use functional TypedDict form.
-TelegramCallbackQuery = TypedDict("TelegramCallbackQuery", {
-    "id": str,
-    "from": TelegramUser,
-    "message": TelegramMessageDict,
-    "data": str,
-}, total=False)
-
-
-
-class TelegramUpdate(TypedDict, total=False):
-    """Telegram Update object fields (raw webhook payload)."""
-    update_id: int
-    message: TelegramMessageDict
-    edited_message: TelegramMessageDict
-    callback_query: TelegramCallbackQuery
+# ── Bridge-only TypedDict models ─────────────────────────────────────
+# Types owned by telegram.py and claudecode.py are imported above via
+# `from telegram import *` and `from claudecode import *`.
+# Only bridge-specific types are defined here.
 
 
 
@@ -250,130 +118,8 @@ class WorkerEndpointInfo(TypedDict, total=False):
     note: str
 
 
-
-# ── Probe / token / state TypedDicts ────────────────────────────────
-
-class DiskUsageDict(TypedDict, total=False):
-    """Disk usage probe result from _check_disk_usage."""
-    pct: float
-    free_gb: float
-    total_gb: float
-    ts: float  # added when stored in HostHealthState
-
-
-
-class MemUsageDict(TypedDict, total=False):
-    """Memory usage probe result from _check_mem_usage."""
-    pct: int | float
-    used_gb: float
-    total_gb: float
-    avail_gb: float
-    top_procs: list[dict[str, object]]
-    ts: float
-
-
-
-class IoUsageDict(TypedDict, total=False):
-    """IO probe result from _check_io_usage."""
-    iowait_pct: float
-    read_iops: int
-    write_iops: int
-    util_pct: float
-    ts: float
-
-
-
-class WorktreeItemDict(TypedDict):
-    """Single worktree entry in worktree usage probe."""
-    path: str
-    size_gb: float
-
-
-
-class WorktreeUsageDict(TypedDict):
-    """Worktree usage probe result for a host."""
-    total_gb: float
-    items: list[WorktreeItemDict]
-    ts: float
-
-
-
-class RewindTokenEntry(TypedDict):
-    """Shape of entries in REWIND_TOKENS."""
-    name: str
-    expires_at: float
-
-
-
-class PrReviewTokenEntry(TypedDict):
-    """Shape of entries in PR_REVIEW_TOKENS."""
-    pr_num: int
-    owner: str
-    repo: str
-    expires_at: float
-
-
-
-class ProcStatsEntry(TypedDict):
-    """Per-process stats from ps (used by _ps_stats)."""
-    cpu: float
-    state: str
-
-
-
-class QuestionOption(TypedDict):
-    """A single option in an interactive prompt."""
-    num: int
-    label: str
-    selected: bool
-
-
-
-class QuestionDetails(TypedDict):
-    """Interactive question details extracted from tmux pane output."""
-    header: str
-    options: list[QuestionOption]
-    selected_num: int
-
-
-
-class MediaGroupEntry(TypedDict):
-    """Buffered media group state during collection."""
-    items: list[TelegramMessageDict]
-    caption: str
-    timer: threading.Timer | None
-
-
-
-class ReminderState(TypedDict):
-    """Per-worker learning-reminder state."""
-    response_count: int
-    last_reminder_ts: float
-    last_response_ts: float
-    reminder_pending: bool
-
-
-
-class HealthSummaryDict(TypedDict, total=False):
-    """Per-host health summary returned by HostHealthState.to_health_summary."""
-    ssh_down: bool
-    ssh_down_since: float | None
-    disk: DiskUsageDict | None
-    mem: MemUsageDict | None
-    io: IoUsageDict | None
-    cpu_hogs: list["CpuHogEntry"]
-    worktrees: WorktreeUsageDict | None
-
-
-
-class MachineHealthDict(TypedDict, total=False):
-    """Health status for a single machine."""
-    status: str
-    down_since: float | None
-    last_error: str | None
-    disk: DiskUsageDict | None
-    memory: MemUsageDict | None
-    io: IoUsageDict | None
+# Probe/token types (DiskUsageDict, MemUsageDict, etc.) → claudecode.py
+# Telegram types (MediaGroupEntry, etc.) → telegram.py
 
 
 
@@ -404,80 +150,7 @@ class MachinesCatalogResponse(TypedDict):
 
 
 
-class GitPushStateResult(TypedDict, total=False):
-    """Result metadata from _git_push_state."""
-    orig_sha: str
-    orig_branch: str
-    staged_files: list[str]
-    stash_sha: str | None
-
-
-
-class CodexTranscriptEntry(TypedDict, total=False):
-    """A parsed entry from a codex transcript."""
-    role: str
-    text: str
-    timestamp: str
-
-
-
-class CpuHogEntry(TypedDict, total=False):
-    """Process entry from _get_cpu_hogs."""
-    pid: int
-    cpu: float
-    etime_min: int
-    cmd: str
-
-
-
-class TmuxSessionDict(TypedDict, total=False):
-    """Shape of a scanned tmux session entry."""
-    tmux: str
-    backend: str
-    host: str           # optional — present only for remote sessions
-    protocol: str       # optional — relay protocol version
-    callback_url: str   # optional — callback URL for relay workers
-    version: str        # optional — bridge version
-    activity: str       # optional — current activity
-    context_pct: str    # optional — context usage percentage
-
-
-
-class WorkerSessionDict(TypedDict, total=False):
-    """Shape of a legacy session dict for backward compatibility."""
-    backend: str
-    tmux: str
-    host: str
-    callback_url: str
-    protocol: str
-    version: str
-
-
-
-class RegistryWorkerDict(TypedDict, total=False):
-    """Raw dict shape of a single worker entry in workers.json.
-
-    The dataclass WorkerRegistryEntry (below) is the rich model equivalent.
-    """
-    backend: str
-    chat_id: int | None
-    hire_time: int
-    host: str           # optional
-    home_host: str | None  # optional — preserved across re-registrations
-    home_cwd: str | None   # optional — preserved across re-registrations
-    protocol: str       # optional — "http" for callback workers
-    callback_url: str   # optional — for callback workers
-    version: str        # optional — for callback workers
-    tools: dict[str, object]  # optional — for callback workers; shape varies
-
-
-
-class RegistryFileDict(TypedDict, total=False):
-    """Raw dict shape of the top-level workers.json file."""
-    version: int
-    workers: dict[str, RegistryWorkerDict]
-
-
+# Worker types (GitPushStateResult, TmuxSessionDict, RegistryWorkerDict, etc.) → claudecode.py
 
 # ── Transcript / Connector / Endpoint TypedDicts ─────────────────────
 
@@ -690,43 +363,7 @@ class NodeConfigDict(TypedDict, total=False):
 
 
 
-# ── NamedTuple models for structured returns ──────────────────────────
-
-class WorkerStateEntry(NamedTuple):
-    """Worker state as tracked by watchdog: (status, reason, since_timestamp)."""
-    status: str
-    reason: str
-    since: float
-
-
-class ParsedWorkerTarget(NamedTuple):
-    """Result of parsing 'name@host' or 'name' worker target."""
-    name: str
-    host: str | None
-
-
-
-class FileValidation(NamedTuple):
-    """Result of validating a file path (photo or document)."""
-    ok: bool
-    detail: Path | str  # Path on success, error message on failure
-
-
-
-class TmuxActivityResult(NamedTuple):
-    """Result of reading tmux pane activity."""
-    activity: str
-    context_pct: str | None
-    raw_lines: list[str] | None
-
-
-
-class AuthorDetection(NamedTuple):
-    """Result of detecting message author from text prefix."""
-    author: str
-    avatar_html: str
-    display_text: str
-
+# NamedTuples (WorkerStateEntry, FileValidation, etc.) → telegram.py / claudecode.py
 
 # ── Bridge runtime state (routing/focus) ───────────────────────────────
 
@@ -1317,28 +954,7 @@ admin_chat_id: ChatId | None = int(ADMIN_CHAT_ID_ENV) if ADMIN_CHAT_ID_ENV else 
 _app_context: AppContext | None = None
 
 # ── End of shared types/constants ─────────────────────────────────────
-# Now safe to import telegram.py and claudecode.py (they do
-# ``from bridge import ...`` which resolves against the names above).
-
-from telegram import *  # noqa: F401,F403
-from telegram import (
-    _TelegramHTMLSanitizer,
-    _init_transport,
-    _prepare_photo_for_telegram,
-    _split_protected_segments, _collapse_excess_newlines,
-    _parse_media_tags,
-    _sanitize_telegram_html,
-    _render_md_inline_plain, _render_md_inline_html,
-    _render_table_as_pre, _wrap_plain_tables,
-    _pipe_tables_to_html,
-    _MEDIA_GROUP_WAIT,
-    _extract_msg_text,
-    _build_cwd_change_notice,
-    _normalize_activity,
-    _team_attention_summary,
-    _format_watchdog_status as _format_watchdog_status_pure,
-    format_team_lines as _format_team_lines_pure,
-)
+# telegram.py and claudecode.py imported at top of file (no circular deps).
 
 # ── Control plane classes (from claudecode.py) ───────────────────────
 
@@ -1392,154 +1008,14 @@ class WorkerRegistryEntry:
 
 
 
-class ProcessRegistry:
-    """Tracks background process PIDs, pipe reader threads, and pending locks."""
-
-    def __init__(self) -> None:
-        """Initialize adapter process tracking and bridge PID references."""
-        self.adapter_pids: dict[str, tuple[subprocess.Popen[str], IO[str] | None]] = {}
-        self.adapter_pids_lock: threading.Lock = threading.Lock()
-        self.pipe_readers: dict[str, tuple[threading.Thread, threading.Event]] = {}
-        self.pipe_readers_lock: threading.Lock = threading.Lock()
-        self.pending_locks: dict[str, threading.Lock] = {}
-        self.pending_locks_guard: threading.Lock = threading.Lock()
+# ProcessRegistry → claudecode.py
 
 
 
 
 
-class WorkerWatchdogState:
-    """Tracks per-worker health, probe results, restart coordination, and watchdog locks."""
-
-    def __init__(self) -> None:
-        # Worker probe state
-        """Initialize worker watchdog counters, locks, and health maps."""
-        self.worker_states: dict[str, WorkerStateEntry] = {}
-        self.last_child_ts: dict[str, float] = {}
-        self.last_seen_claude: dict[str, float] = {}
-        self.last_hook_ts: dict[str, float] = {}
-        self.last_alert_ts: dict[str, float] = {}
-        self.alert_msg_ids: dict[str, tuple[int, str]] = {}
-        self.idle_streak: dict[str, int] = {}
-        self.prev_worker_states: dict[str, str] = {}
-        self.consecutive_probe_failures: dict[str, int] = {}
-        self.consecutive_good_probes: dict[str, int] = {}
-        self.consecutive_bad_probes: dict[str, int] = {}
-        self.idle_child_baseline: dict[str, int] = {}
-        self.prev_children: dict[str, int] = {}
-        self.last_activity_ts: dict[str, float] = {}
-        self.worker_cwds: dict[str, str] = {}
-        # Restart coordination
-        self.recent_restarts: dict[str, float] = {}
-        self.restart_in_progress: dict[str, float] = {}
-        self.restart_lock: threading.Lock = threading.Lock()
-        self.force_restart_pending_cwd: dict[str, bool] = {}
-        self.waiting_input_details: dict[str, QuestionDetails] = {}
-        # Alert cooldowns
-        self.last_resolved_ts: dict[str, float] = {}
-        # Global watchdog lock
-        self.lock: threading.Lock = threading.Lock()
-        # Stop event for clean shutdown
-        self.stop_event: threading.Event = threading.Event()
-
-    def reset(self) -> None:
-        """Reset all state (useful for testing)."""
-        self.__init__()  # type: ignore[misc]
-
-    def clear_worker(self, name: str) -> None:
-        """Remove all tracking state for a worker."""
-        for store in (
-            self.worker_states, self.last_child_ts, self.last_seen_claude,
-            self.last_hook_ts, self.last_alert_ts, self.alert_msg_ids,
-            self.idle_streak, self.prev_worker_states,
-            self.consecutive_probe_failures, self.consecutive_good_probes,
-            self.consecutive_bad_probes, self.idle_child_baseline,
-            self.prev_children, self.last_activity_ts, self.worker_cwds,
-            self.recent_restarts, self.restart_in_progress,
-            self.force_restart_pending_cwd, self.waiting_input_details,
-            self.last_resolved_ts,
-        ):
-            store.pop(name, None)
-
-
-
-class LearningReminderState:
-    """Tracks per-worker learning reminder counters, timers, and persistence."""
-
-    def __init__(self) -> None:
-        """Initialize per-worker reminder counters, lock, and idle timer."""
-        self.state: dict[str, ReminderState] = {}
-        self.lock: threading.Lock = threading.Lock()
-        self.idle_scan_timer: threading.Timer | None = None
-
-
-class HostHealthState:
-    """Tracks health metrics for all remote hosts (SSH, disk, CPU, memory, IO, worktrees, Tailscale).
-
-    Thread safety: all reads/writes to mutable dicts must be under watchdog.lock
-    (the canonical lock for all watchdog + host_health state).
-    """
-
-    def __init__(self) -> None:
-        """Initialize per-host health metrics (SSH, disk, memory, IO, CPU, Tailscale)."""
-        # SSH connectivity
-        self.ssh_failures: dict[str, int] = {}
-        self.down: dict[str, bool] = {}
-        self.down_since: dict[str, float] = {}
-        self.last_error: dict[str, str] = {}
-        # Disk
-        self.disk_usage: dict[str, DiskUsageDict] = {}
-        self.disk_alert_ts: dict[str, float] = {}
-        self.disk_alerted: dict[str, str | bool] = {}
-        # CPU hogs
-        self.cpu_hogs: dict[str, list[CpuHogEntry]] = {}
-        self.cpu_hog_alert_ts: dict[str, float] = {}
-        # Worktrees
-        self.worktree_usage: dict[str, WorktreeUsageDict] = {}
-        self.worktree_alert_ts: dict[str, float] = {}
-        self.worktree_alerted: dict[str, bool] = {}
-        # Memory
-        self.mem_usage: dict[str, MemUsageDict] = {}
-        self.mem_alert_ts: dict[str, float] = {}
-        self.mem_alerted: dict[str, bool] = {}
-        # IO
-        self.io_usage: dict[str, IoUsageDict] = {}
-        self.io_alert_ts: dict[str, float] = {}
-        self.io_alerted: dict[str, bool] = {}
-        # Infra / Tailscale
-        self.tailscale_down: bool = False
-        self.tailscale_alert_ts: float = 0.0
-
-    def reset(self) -> None:
-        """Reset all state (useful for testing)."""
-        self.__init__()  # type: ignore[misc]
-
-    def to_health_summary(self, host: str) -> HealthSummaryDict:
-        """Return a typed summary dict for a single host."""
-        return HealthSummaryDict(
-            ssh_down=self.down.get(host, False),
-            ssh_down_since=self.down_since.get(host),
-            disk=self.disk_usage.get(host),
-            mem=self.mem_usage.get(host),
-            io=self.io_usage.get(host),
-            cpu_hogs=self.cpu_hogs.get(host, []),
-            worktrees=self.worktree_usage.get(host),
-        )
-
-
-from claudecode import *  # noqa: F401,F403
-from claudecode import (  # underscore names excluded from * import
-    _acquire_flock, _cache_session_id, _capture_pane_text,
-    _codex_load_session_id, _codex_save_session_id,
-    _codex_session_id_path, _detect_os_family,
-    _ensure_workspace_trusted, _find_codex_transcript, _forward_pipe_message,
-    _get_remote_home, _get_tmux_send_lock,
-    _INTERACTIVE_CONTENT, _INTERACTIVE_FOOTERS,
-    _is_git_repo, _LEARNING_REMINDER_TEXT, _log_session_event, _project_slug,
-    _release_flock, _remote_run, _resolve_remote_tool,
-    _scan_latest_session_id, _tmux_pane_pids,
-    _which_binary,
-)
+# WorkerWatchdogState, LearningReminderState, HostHealthState → claudecode.py
+# (imported via `from claudecode import *` at top of file)
 
 
 
